@@ -135,48 +135,59 @@ public abstract class PlayoutModeSchedulerBase<T>(ILogger logger) : IPlayoutMode
         return startTime;
     }
 
-    protected Tuple<PlayoutBuilderState, List<PlayoutItem>> AddTailFiller(
-        PlayoutBuilderState playoutBuilderState,
-        Dictionary<CollectionKey, IMediaCollectionEnumerator> collectionEnumerators,
-        ProgramScheduleItem scheduleItem,
-        List<PlayoutItem> playoutItems,
-        DateTimeOffset nextItemStart,
-        PlayoutBuildWarnings warnings,
-        CancellationToken cancellationToken)
+protected Tuple<PlayoutBuilderState, List<PlayoutItem>> AddTailFiller(
+    PlayoutBuilderState playoutBuilderState,
+    Dictionary<CollectionKey, IMediaCollectionEnumerator> collectionEnumerators,
+    ProgramScheduleItem scheduleItem,
+    List<PlayoutItem> playoutItems,
+    DateTimeOffset nextItemStart,
+    PlayoutBuildWarnings warnings,
+    CancellationToken cancellationToken)
+{
+    var newItems = new List<PlayoutItem>(playoutItems);
+    PlayoutBuilderState nextState = playoutBuilderState;
+
+    if (scheduleItem.TailFiller != null)
     {
-        var newItems = new List<PlayoutItem>(playoutItems);
-        PlayoutBuilderState nextState = playoutBuilderState;
+        IMediaCollectionEnumerator enumerator =
+            collectionEnumerators[CollectionKey.ForFillerPreset(scheduleItem.TailFiller)];
 
-        if (scheduleItem.TailFiller != null)
+        // Loop until the remaining time is exhausted or no more items are available
+        while (enumerator.Current.IsSome && nextState.CurrentTime < nextItemStart)
         {
-            IMediaCollectionEnumerator enumerator =
-                collectionEnumerators[CollectionKey.ForFillerPreset(scheduleItem.TailFiller)];
+            TimeSpan remainingTime = nextItemStart - nextState.CurrentTime;
+            List<MediaItem> possibleItems = new List<MediaItem>();
 
-            while (enumerator.Current.IsSome && nextState.CurrentTime < nextItemStart)
+            // Collect all media items that fit within the remaining time
+            foreach (MediaItem mediaItem in enumerator.Current)
             {
-                MediaItem mediaItem = enumerator.Current.ValueUnsafe();
-
                 TimeSpan itemDuration = mediaItem.GetDurationForPlayout();
-                TimeSpan inPoint = InPointForMediaItem(mediaItem);
-
-                if (nextState.CurrentTime + itemDuration > nextItemStart)
+                if (itemDuration <= remainingTime)
                 {
-                    warnings.TailFillerTooLong++;
-                    break;
+                    possibleItems.Add(mediaItem);
                 }
+            }
+
+            if (possibleItems.Count > 0)
+            {
+                // Randomly pick one item from the possible items
+                int randomIndex = _random.Next(possibleItems.Count);
+                MediaItem selectedItem = possibleItems[randomIndex];
+                TimeSpan selectedDuration = selectedItem.GetDurationForPlayout();
+                TimeSpan inPoint = InPointForMediaItem(selectedItem);
 
                 var playoutItem = new PlayoutItem
                 {
                     PlayoutId = playoutBuilderState.PlayoutId,
-                    MediaItemId = IdForMediaItem(mediaItem),
+                    MediaItemId = IdForMediaItem(selectedItem),
                     Start = nextState.CurrentTime.UtcDateTime,
-                    Finish = nextState.CurrentTime.UtcDateTime + itemDuration,
+                    Finish = nextState.CurrentTime.UtcDateTime + selectedDuration,
                     InPoint = inPoint,
-                    OutPoint = inPoint + itemDuration,
+                    OutPoint = inPoint + selectedDuration,
                     FillerKind = FillerKind.Tail,
                     GuideGroup = nextState.NextGuideGroup,
                     DisableWatermarks = !scheduleItem.TailFiller.AllowWatermarks,
-                    ChapterTitle = ChapterTitleForMediaItem(mediaItem),
+                    ChapterTitle = ChapterTitleForMediaItem(selectedItem),
                     SchedulingContext = GetSchedulingContext(scheduleItem, scheduleItem.TailFillerId, enumerator)
                 };
 
@@ -184,15 +195,22 @@ public abstract class PlayoutModeSchedulerBase<T>(ILogger logger) : IPlayoutMode
 
                 nextState = nextState with
                 {
-                    CurrentTime = nextState.CurrentTime + itemDuration
+                    CurrentTime = nextState.CurrentTime + selectedDuration
                 };
 
                 enumerator.MoveNext(playoutItem.StartOffset);
             }
+            else
+            {
+                // No items can fit, so exit the loop
+                warnings.TailFillerTooLong++;
+                break;
+            }
         }
-
-        return Tuple(nextState, newItems);
     }
+
+    return Tuple(nextState, newItems);
+}
 
     protected Tuple<PlayoutBuilderState, List<PlayoutItem>> AddFallbackFiller(
         PlayoutBuilderState playoutBuilderState,
