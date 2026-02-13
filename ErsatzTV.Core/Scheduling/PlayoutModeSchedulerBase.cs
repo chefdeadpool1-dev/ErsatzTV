@@ -1,4 +1,4 @@
-﻿using System.Diagnostics.CodeAnalysis;
+using System.Diagnostics.CodeAnalysis;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using ErsatzTV.Core.Domain;
@@ -134,6 +134,7 @@ public abstract class PlayoutModeSchedulerBase<T>(ILogger logger) : IPlayoutMode
 
         return startTime;
     }
+
 protected Tuple<PlayoutBuilderState, List<PlayoutItem>> AddTailFiller(
     PlayoutBuilderState playoutBuilderState,
     Dictionary<CollectionKey, IMediaCollectionEnumerator> collectionEnumerators,
@@ -151,64 +152,93 @@ protected Tuple<PlayoutBuilderState, List<PlayoutItem>> AddTailFiller(
         IMediaCollectionEnumerator enumerator =
             collectionEnumerators[CollectionKey.ForFillerPreset(scheduleItem.TailFiller)];
 
-        // Keep going until we can't fit anything else
-        while (enumerator.Current.IsSome && nextState.CurrentTime < nextItemStart)
-        {
-            TimeSpan remaining = nextItemStart - nextState.CurrentTime;
+        // remaining time to fill with tail filler
+        TimeSpan remainingToFill = nextItemStart - nextState.CurrentTime;
 
-            // If the smallest possible item can't fit, stop
-            if (remaining < enumerator.MinimumDuration)
+        // Guard against pathological enumerators that never advance (or tiny libraries with no-fit items).
+        // This counter resets when we successfully schedule something.
+        int skipStreak = 0;
+        const int MaxSkipStreak = 500;
+
+        // Same stopping rules as AddDurationFiller:
+        // - must have items
+        // - must have positive remaining time
+        // - remaining time must be >= minimum duration available in this enumerator
+        while (enumerator.Current.IsSome &&
+               remainingToFill > TimeSpan.Zero &&
+               remainingToFill >= enumerator.MinimumDuration)
+        {
+            foreach (MediaItem mediaItem in enumerator.Current)
+            {
+                TimeSpan itemDuration = mediaItem.GetDurationForPlayout();
+                TimeSpan inPoint = InPointForMediaItem(mediaItem);
+
+                // If it fits, schedule it and reduce remaining time
+                if (remainingToFill - itemDuration >= TimeSpan.Zero)
+                {
+                    var playoutItem = new PlayoutItem
+                    {
+                        PlayoutId = playoutBuilderState.PlayoutId,
+                        MediaItemId = IdForMediaItem(mediaItem),
+                        Start = nextState.CurrentTime.UtcDateTime,
+                        Finish = (nextState.CurrentTime + itemDuration).UtcDateTime,
+                        InPoint = inPoint,
+                        OutPoint = inPoint + itemDuration,
+                        FillerKind = FillerKind.Tail,
+                        GuideGroup = nextState.NextGuideGroup,
+                        DisableWatermarks = !scheduleItem.TailFiller.AllowWatermarks,
+                        ChapterTitle = ChapterTitleForMediaItem(mediaItem),
+                        SchedulingContext = GetSchedulingContext(scheduleItem, scheduleItem.TailFillerId, enumerator)
+                    };
+
+                    newItems.Add(playoutItem);
+
+                    nextState = nextState with
+                    {
+                        CurrentTime = nextState.CurrentTime + itemDuration
+                    };
+
+                    remainingToFill -= itemDuration;
+
+                    // Advance enumerator after a successful schedule
+                    enumerator.MoveNext(playoutItem.StartOffset);
+
+                    // Reset skip streak since we made progress
+                    skipStreak = 0;
+
+                    // If we filled everything, we're done
+                    if (remainingToFill <= TimeSpan.Zero)
+                    {
+                        break;
+                    }
+                }
+                else
+                {
+                    // Too long: skip and keep searching (this is the key change vs break;)
+                    warnings.TailFillerTooLong++;
+                    enumerator.MoveNext(Option<DateTimeOffset>.None);
+
+                    skipStreak++;
+                    if (skipStreak >= MaxSkipStreak)
+                    {
+                        // Bail out to avoid infinite loops if nothing ever fits / enumerator misbehaves
+                        break;
+                    }
+                }
+            }
+
+            if (skipStreak >= MaxSkipStreak)
             {
                 break;
             }
 
-            MediaItem mediaItem = enumerator.Current.ValueUnsafe();
-
-            TimeSpan itemDuration = mediaItem.GetDurationForPlayout();
-            TimeSpan inPoint = InPointForMediaItem(mediaItem);
-
-            if (itemDuration <= remaining)
-            {
-                var playoutItem = new PlayoutItem
-                {
-                    PlayoutId = playoutBuilderState.PlayoutId,
-                    MediaItemId = IdForMediaItem(mediaItem),
-                    Start = nextState.CurrentTime.UtcDateTime,
-                    Finish = nextState.CurrentTime.UtcDateTime + itemDuration,
-                    InPoint = inPoint,
-                    OutPoint = inPoint + itemDuration,
-                    FillerKind = FillerKind.Tail,
-                    GuideGroup = nextState.NextGuideGroup,
-                    DisableWatermarks = !scheduleItem.TailFiller.AllowWatermarks,
-                    ChapterTitle = ChapterTitleForMediaItem(mediaItem),
-                    SchedulingContext = GetSchedulingContext(scheduleItem, scheduleItem.TailFillerId, enumerator)
-                };
-
-                newItems.Add(playoutItem);
-
-                nextState = nextState with
-                {
-                    CurrentTime = nextState.CurrentTime + itemDuration
-                };
-
-                // advance based on what we actually played
-                enumerator.MoveNext(playoutItem.StartOffset);
-            }
-            else
-            {
-                // Too long? Skip it and keep hunting (THIS is the key difference)
-                warnings.TailFillerTooLong++;
-
-                // advance without "playing" anything
-                enumerator.MoveNext(Option<DateTimeOffset>.None);
-            }
+            // Recompute in case nextState moved
+            remainingToFill = nextItemStart - nextState.CurrentTime;
         }
     }
 
     return Tuple(nextState, newItems);
 }
-
-
 
 
     protected Tuple<PlayoutBuilderState, List<PlayoutItem>> AddFallbackFiller(
